@@ -1,0 +1,447 @@
+# Original code Copyright (c) Meta Platforms, Inc. and affiliates.
+# Licensed under the original license in the LICENSE file.
+#
+# Modified in 2025
+#   - Added CAE, CAE+, CAE+ w/o U algorithms
+#   - Simplified unrelated parts
+#
+# Additional modifications are released under CC BY-NC 4.0
+
+
+import logging
+import os
+import threading
+import time
+import timeit
+import pprint
+
+import numpy as np
+import random
+
+
+import torch
+from torch import multiprocessing as mp
+from torch import nn
+
+from src.core import file_writer
+from src.core import prof
+from src.core import vtrace
+
+import src.models as models
+import src.losses as losses
+from torch.utils.tensorboard import SummaryWriter
+from src.algos.utils import get_maxframes
+
+from src.env_utils import FrameStack, Environment
+from src.utils import get_batch, log, create_env, create_buffers, act, create_heatmap_buffers
+
+NetHackStateEmbeddingNet = models.NetHackStateEmbeddingNet
+MiniHackInverseDynamicsNet = models.MiniHackInverseDynamicsNet
+
+
+def learn(actor_model,
+          model,
+          inverse_dynamics_model,
+          actor_elliptical_encoder,
+          elliptical_encoder,
+          batch,
+          initial_agent_state,
+          optimizer,
+          elliptical_encoder_optimizer,
+          inverse_dynamics_optimizer,
+          scheduler,
+          flags,
+          frames=None,
+          lock=threading.Lock()):
+    """ performs a learning step """
+    with lock:
+        timings = prof.Timings()
+
+        intrinsic_rewards = batch['bonus_reward'][1:]
+
+        # ICM Loss
+        elliptical_encoder.train()
+        inverse_dynamics_model.train()
+        icm_state_emb_all, _ = elliptical_encoder(batch, tuple())
+        icm_state_emb = icm_state_emb_all[:-1]
+        icm_next_state_emb = icm_state_emb_all[1:]
+        predict_actions = inverse_dynamics_model(icm_state_emb, icm_next_state_emb)
+        inverse_dynamics_loss = losses.compute_inverse_dynamics_loss(predict_actions, batch['action'][1:])
+
+        learner_outputs, unused_state = model(batch, initial_agent_state)
+        bootstrap_value = learner_outputs['baseline'][-1]
+
+        batch = {key: tensor[1:] for key, tensor in batch.items()}
+        learner_outputs = {
+            key: tensor[:-1]
+            for key, tensor in learner_outputs.items()
+        }
+
+        rewards = batch['reward']
+
+        # running normalization to the intrinsic or extrinsic rewards
+        if flags.reward_norm == 'int':
+            model.update_running_moments(intrinsic_rewards)
+            std = model.get_running_std()
+            if std > 0:
+                intrinsic_rewards /= std
+        elif flags.reward_norm == 'ext':
+            model.update_running_moments(rewards)
+            std = model.get_running_std()
+            if std > 0:
+                rewards /= std
+
+        if flags.no_reward:
+            total_rewards = intrinsic_rewards * flags.intrinsic_reward_coef
+        else:
+            total_rewards = rewards + intrinsic_rewards * flags.intrinsic_reward_coef
+
+        if flags.reward_norm == 'all':
+            model.update_running_moments(total_rewards)
+            std = model.get_running_std()
+            if std > 0:
+                total_rewards /= std
+
+        if flags.clip_rewards == 1:
+            clipped_rewards = torch.clamp(total_rewards, -1, 1)
+        else:
+            clipped_rewards = total_rewards
+
+        discounts = (~batch['done']).float() * flags.discounting
+
+        # compute policy losses
+        vtrace_returns = vtrace.from_logits(
+            behavior_policy_logits=batch['policy_logits'],
+            target_policy_logits=learner_outputs['policy_logits'],
+            actions=batch['action'],
+            discounts=discounts,
+            rewards=clipped_rewards,
+            values=learner_outputs['baseline'],
+            bootstrap_value=bootstrap_value)
+
+        pg_loss = losses.compute_policy_gradient_loss(
+            learner_outputs['policy_logits'],
+            batch['action'],
+            vtrace_returns.pg_advantages
+        )
+
+        baseline_loss = flags.baseline_cost * losses.compute_baseline_loss(vtrace_returns.vs - learner_outputs['baseline'])
+        entropy_loss = flags.entropy_cost * losses.compute_entropy_loss(learner_outputs['policy_logits'])
+
+        total_loss = pg_loss + baseline_loss + entropy_loss + inverse_dynamics_loss
+
+        episode_returns = batch['episode_return'][batch['done']]
+        stats = {
+            'mean_episode_return': torch.mean(episode_returns).item(),
+            'total_loss': total_loss.item(),
+            'pg_loss': pg_loss.item(),
+            'baseline_loss': baseline_loss.item(),
+            'entropy_loss': entropy_loss.item(),
+            'inverse_dynamics_loss': inverse_dynamics_loss.item(),
+            'mean_rewards': torch.mean(rewards).item(),
+            'mean_intrinsic_rewards': torch.mean(intrinsic_rewards).item(),
+            'mean_total_rewards': torch.mean(total_rewards).item(),
+        }
+
+        # update networks
+        optimizer.zero_grad()
+        elliptical_encoder_optimizer.zero_grad()
+        inverse_dynamics_optimizer.zero_grad()
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), flags.max_grad_norm)
+        nn.utils.clip_grad_norm_(inverse_dynamics_model.parameters(), flags.max_grad_norm)
+        nn.utils.clip_grad_norm_(elliptical_encoder.parameters(), flags.max_grad_norm)
+
+        optimizer.step()
+        elliptical_encoder_optimizer.step()
+        inverse_dynamics_optimizer.step()
+
+        actor_model.load_state_dict(model.state_dict())
+        actor_elliptical_encoder.load_state_dict(elliptical_encoder.state_dict())
+        return stats, None
+
+
+def train(flags):
+    xpid = ''
+    xpid += f'env_{flags.env}'
+    xpid += f'-eb_{flags.episodic_bonus_type}'
+    xpid += f'-lr_{flags.learning_rate}'
+    xpid += f'-plr_{flags.predictor_learning_rate}'
+    xpid += f'-entropy_{flags.entropy_cost}'
+    xpid += f'-intweight_{flags.intrinsic_reward_coef}'
+    xpid += f'-ridge_{flags.ridge}'
+    xpid += f'-cr_{flags.clip_rewards}'
+    xpid += f'-rn_{flags.reward_norm}'
+    xpid += f'-seed_{flags.seed}'
+    xpid += f'-comment_{flags.comment}'
+
+    flags.xpid = xpid
+
+    plogger = file_writer.FileWriter(
+        xpid=flags.xpid,
+        xp_args=flags.__dict__,
+        rootdir=flags.savedir,
+    )
+
+    checkpoint_path = os.path.expandvars(
+        os.path.expanduser('%s/%s/%s' % (flags.savedir, flags.xpid, 'model.tar'))
+    )
+    writer = SummaryWriter(flags.tensorboard_dir + f"/{flags.xpid}")
+
+
+    T = flags.unroll_length
+    B = flags.batch_size
+
+    if not flags.disable_cuda and torch.cuda.is_available():
+        log.info('using CUDA ...')
+        flags.device = torch.device(f'cuda:{flags.device}')
+    else:
+        log.info('not using CUDA ...')
+        flags.device = torch.device('cpu')
+
+    # TRY NOT TO MODIFY: seeding
+    random.seed(flags.seed)
+    np.random.seed(flags.seed)
+    torch.manual_seed(flags.seed)
+    torch.backends.cudnn.deterministic = flags.torch_deterministic
+
+    env = create_env(flags)
+    if flags.num_input_frames > 1:
+        env = FrameStack(env, flags.num_input_frames)
+
+    if 'MiniHack' in flags.env:
+        model = models.NetHackPolicyNet(env.observation_space, env.action_space.n, flags.use_lstm)
+        model_parameter = sum(p.numel() for p in model.parameters())
+
+        elliptical_encoder = NetHackStateEmbeddingNet(env.observation_space, False)  # do not use LSTM for encoder
+        encoder_parameter = sum(p.numel() for p in elliptical_encoder.parameters())
+
+        inverse_dynamics_model = MiniHackInverseDynamicsNet(env.action_space.n, emb_size=1024).to(device=flags.device)
+        idn_parameter = sum(p.numel() for p in inverse_dynamics_model.parameters())
+
+        print(f'------- model_parameter: {model_parameter}')
+        print(f'------- encoder_parameter: {encoder_parameter}')
+        print(f'------- idn_parameter: {idn_parameter}')
+
+    else:
+        raise Exception('only MiniHack is supported !!!')
+
+
+    buffers = create_buffers(env.observation_space, model.num_actions, flags)
+    model.share_memory()
+    elliptical_encoder.share_memory()
+
+    initial_agent_state_buffers = []
+    for _ in range(flags.num_buffers):
+        state = model.initial_state(batch_size=1)
+        for t in state:
+            t.share_memory_()
+        initial_agent_state_buffers.append(state)
+
+
+    actor_processes = []
+    ctx = mp.get_context('fork')
+    free_queue = ctx.Queue()
+    full_queue = ctx.Queue()
+
+    episode_state_count_dict = dict()
+    global_state_count_dict = dict()
+
+    for i in range(flags.num_actors):
+        actor = ctx.Process(
+            target=act,
+            args=(i, free_queue, full_queue, model, elliptical_encoder, buffers,
+                  episode_state_count_dict, global_state_count_dict, initial_agent_state_buffers, flags))
+        actor.start()
+        actor_processes.append(actor)
+
+
+    learner_model = models.NetHackPolicyNet(
+        env.observation_space,
+        env.action_space.n,
+        flags.use_lstm,
+        hidden_dim=flags.hidden_dim
+    ).to(flags.device)
+
+    elliptical_learner_encoder = NetHackStateEmbeddingNet(
+        env.observation_space,
+        False,
+        hidden_dim=flags.hidden_dim,
+        p_dropout=flags.dropout
+    ).to(flags.device)
+
+    elliptical_learner_encoder.load_state_dict(elliptical_encoder.state_dict())
+
+
+    optimizer = torch.optim.RMSprop(
+        learner_model.parameters(),
+        lr=flags.learning_rate,
+        momentum=flags.momentum,
+        eps=flags.epsilon,
+        alpha=flags.alpha)
+
+    elliptical_encoder_optimizer = torch.optim.Adam(
+        elliptical_learner_encoder.parameters(),
+        lr=flags.predictor_learning_rate)
+
+    inverse_dynamics_optimizer = torch.optim.Adam(
+        inverse_dynamics_model.parameters(),
+        lr=flags.predictor_learning_rate)
+
+    def lr_lambda(epoch):
+        return 1 - min(epoch * T * B, flags.total_frames) / flags.total_frames
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    logger = logging.getLogger('logfile')
+    stat_keys = [
+        'total_loss',
+        'mean_episode_return',
+        'pg_loss',
+        'baseline_loss',
+        'entropy_loss',
+        'inverse_dynamics_loss',
+        'mean_rewards',
+        'mean_intrinsic_rewards',
+        'mean_total_rewards',
+    ]
+
+    logger.info('# step\t%s', '\t'.join(stat_keys))
+
+    frames, stats = 0, {}
+    step = 0
+
+    if os.path.exists(checkpoint_path):
+        logger.info(f'[loading checkpoint: {checkpoint_path}]')
+        max_frames = get_maxframes(flags.tensorboard_dir + f"/{flags.xpid}", logger)
+        checkpoint = torch.load(checkpoint_path)
+        frames = checkpoint['frames']
+        logger.info(f"max_frames: {frames}, {max_frames}")
+        frames = min(frames, max_frames)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        learner_model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        elliptical_encoder.load_state_dict(checkpoint['elliptical_encoder_state_dict'])
+        elliptical_learner_encoder.load_state_dict(checkpoint['elliptical_encoder_state_dict'])
+        inverse_dynamics_model.load_state_dict(checkpoint['inverse_dynamics_model_state_dict'])
+        elliptical_encoder_optimizer.load_state_dict(checkpoint['elliptical_encoder_optimizer_state_dict'])
+        inverse_dynamics_optimizer.load_state_dict(checkpoint['inverse_dynamics_optimizer_state_dict'])
+
+    def batch_and_learn(i, lock=threading.Lock()):
+        """ thread target for the learning process """
+        nonlocal frames, stats, step
+        timings = prof.Timings()
+
+        while frames < flags.total_frames:
+            timings.reset()
+            batch, agent_state = get_batch(
+                free_queue,
+                full_queue,
+                buffers,
+                initial_agent_state_buffers,
+                flags,
+                timings
+            )
+            stats, decoder_logits = learn(
+                model,
+                learner_model,
+                inverse_dynamics_model,
+                elliptical_encoder,
+                elliptical_learner_encoder,
+                batch,
+                agent_state,
+                optimizer,
+                elliptical_encoder_optimizer,
+                inverse_dynamics_optimizer,
+                scheduler,
+                flags,
+                frames=frames
+            )
+
+            timings.time('learn')
+
+            with lock:
+                to_log = dict(frames=frames)
+                to_log.update({k: stats[k] for k in stat_keys})
+                plogger.log(to_log)
+                frames += T * B
+                step += 1
+                for k in stat_keys:
+                    writer.add_scalar(f"{flags.env}/{k}", stats[k], frames)
+
+        if i == 0:
+            log.info('Batch and learn: %s', timings.summary())
+
+    for m in range(flags.num_buffers):
+        free_queue.put(m)
+
+    threads = []
+    for i in range(flags.num_threads):
+        thread = threading.Thread(
+            target=batch_and_learn, name='batch-and-learn-%d' % i, args=(i,))
+        thread.start()
+        threads.append(thread)
+
+    def checkpoint(frames):
+        checkpoint_path = os.path.expandvars(os.path.expanduser(
+            '%s/%s/%s' % (flags.savedir, flags.xpid, 'model.tar')))
+        log.info('Saving checkpoint to %s', checkpoint_path)
+        torch.save({
+            'frames': frames,
+            'model_state_dict': model.state_dict(),
+            'elliptical_encoder_state_dict': elliptical_encoder.state_dict(),
+            'inverse_dynamics_model_state_dict': inverse_dynamics_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'elliptical_encoder_optimizer_state_dict': elliptical_encoder_optimizer.state_dict(),
+            'inverse_dynamics_optimizer_state_dict': inverse_dynamics_optimizer.state_dict(),
+            'flags': vars(flags),
+        }, checkpoint_path)
+
+    timer = timeit.default_timer
+    try:
+        last_checkpoint_time = timer()
+        while frames < flags.total_frames:
+            start_frames = frames
+            start_time = timer()
+            time.sleep(5)
+
+            if timer() - last_checkpoint_time > flags.save_interval * 60:
+                checkpoint(frames)
+                last_checkpoint_time = timer()
+
+            fps = (frames - start_frames) / (timer() - start_time)
+
+            if stats.get('episode_returns', None):
+                mean_return = 'return per episode: %.1f. ' % stats['mean_episode_return']
+            else:
+                mean_return = ''
+
+            total_loss = stats.get('total_loss', float('inf'))
+            if stats:
+                log.info(
+                    'After %i frames: loss %f @ %.1f fps. Mean Return %.1f. \n Stats \n %s',
+                    frames,
+                    total_loss,
+                    fps,
+                    stats['mean_episode_return'],
+                    pprint.pformat(stats),
+                )
+
+
+    except KeyboardInterrupt:
+        return
+    else:
+        for thread in threads:
+            thread.join()
+        log.info('Learning finished after %d frames.', frames)
+    finally:
+        for _ in range(flags.num_actors):
+            free_queue.put(None)
+        for actor in actor_processes:
+            actor.join(timeout=1)
+
+    checkpoint(frames)
+    plogger.close()
+

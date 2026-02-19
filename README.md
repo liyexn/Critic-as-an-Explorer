@@ -1,0 +1,161 @@
+# CAE: Critic as an Explorer
+
+![Figure](CAE_comp.png)
+
+## Overview
+
+This repository contains the official implementation of **CAE: Critic as an Explorer**, a reinforcement learning exploration framework that repurposes the critic to guide exploration.
+
+The repository provides implementations of the following methods:
+
+- **CAE**
+- **CAE+**
+- **CAE+ without U**
+- **Baseline E3B**
+
+> ⚠️ **Note**: This repository is modified and extended from the open-source repository [E3B](https://github.com/facebookresearch/e3b).
+
+---
+
+## Installation
+
+Create a conda environment and install the required dependencies:
+
+```bash
+conda create -n cae python=3.8
+conda activate cae
+
+cd CAE/
+pip install -r requirements.txt --no-use-pep517
+```
+
+Make sure to install MiniHack following the instructions:
+
+```
+https://github.com/facebookresearch/minihack
+```
+
+---
+
+## Training
+
+All experiments are launched through `main.py`.
+
+---
+
+### Baseline E3B
+
+Train an agent using the E3B baseline:
+
+```bash
+cd torchbeast/
+
+# run
+OMP_NUM_THREADS=1 python main.py \
+  --learning_rate 0.0001 \
+  --model e3b \
+  --episodic_bonus_type elliptical-icm \
+  --savedir ./results/elliptical/ \
+  --env MiniHack-MultiRoom-N4-v0 \
+  --ridge 0.1 \
+  --reward_norm int \
+  --intrinsic_reward_coef 1.0 \
+  --seed 1 \
+  --tensorboard_dir results/tensorboard
+```
+
+---
+
+### CAE Variants
+
+Train agents using CAE-based exploration methods:
+
+```bash
+cd torchbeast/
+
+# CAE+
+OMP_NUM_THREADS=1 python main.py \
+  --learning_rate 0.0001 \
+  --model caep \
+  --episodic_bonus_type caep \
+  --savedir ./results/elliptical/ \
+  --env MiniHack-MultiRoom-N4-v0 \
+  --ridge 0.1 \
+  --reward_norm int \
+  --intrinsic_reward_coef 1.0 \
+  --seed 1 \
+  --tensorboard_dir results/tensorboard \
+  --weighted_emb_size 256
+
+# CAE
+OMP_NUM_THREADS=1 python main.py \
+  --learning_rate 0.0001 \
+  --model cae \
+  --episodic_bonus_type cae \
+  --savedir ./results/elliptical/ \
+  --env MiniHack-MultiRoom-N4-v0 \
+  --ridge 0.1 \
+  --reward_norm int \
+  --intrinsic_reward_coef 1.0 \
+  --seed 1 \
+  --tensorboard_dir results/tensorboard
+
+# CAE+ without U
+OMP_NUM_THREADS=1 python main.py \
+  --learning_rate 0.0001 \
+  --model caep_wo_u \
+  --episodic_bonus_type caep_wo_u \
+  --savedir ./results/elliptical/ \
+  --env MiniHack-MultiRoom-N4-v0 \
+  --ridge 0.1 \
+  --reward_norm int \
+  --intrinsic_reward_coef 1.0 \
+  --seed 1 \
+  --tensorboard_dir results/tensorboard
+```
+
+---
+
+## Logging
+
+Training outputs are saved under:
+
+```
+CAE/torchbeast/results/
+```
+
+TensorBoard logs:
+
+```
+CAE/torchbeast/results/tensorboard
+```
+
+Launch TensorBoard:
+
+```bash
+tensorboard --logdir ~/CAE/torchbeast/results/tensorboard/
+```
+
+---
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@misc{Li2025CAE,
+  title         = {CAE: Repurposing the Critic as an Explorer in Deep Reinforcement Learning},
+  author        = {Yexin Li and Pring Wong and Hanfang Zhang and Shuo Chen and Siyuan Qi},
+  year          = {2025},
+  eprint        = {2503.18980},
+  archivePrefix = {arXiv}
+}
+```
+
+---
+
+## License
+
+The majority of this project is licensed under **CC-BY-NC**.  
+Please check individual files for specific license headers where applicable.
+
