@@ -143,12 +143,13 @@ tensorboard --logdir ~/CAE/torchbeast/results/tensorboard/
 If you use this code in your research, please cite:
 
 ```bibtex
-@misc{Li2025CAE,
-  title         = {CAE: Repurposing the Critic as an Explorer in Deep Reinforcement Learning},
-  author        = {Yexin Li and Pring Wong and Hanfang Zhang and Shuo Chen and Siyuan Qi},
-  year          = {2025},
-  eprint        = {2503.18980},
-  archivePrefix = {arXiv}
+@article{li2026cae,
+title    = {CAE: Repurposing the Critic as an Explorer in Deep Reinforcement Learning},
+author   = {Yexin Li},
+journal  = {Transactions on Machine Learning Research},
+issn     = {2835-8856},
+year     = {2026},
+url      = {https://openreview.net/forum?id=54MOD02xC2}
 }
 ```
 
