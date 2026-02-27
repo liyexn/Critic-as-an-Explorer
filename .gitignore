@@ -1,0 +1,8 @@
+torchbeast/results/
+*.pyc
+__pycache__/
+torchbeast/src/algos/__pycache__/
+torchbeast/src/__pycache__/
+*.log
+*.out
+.idea/
